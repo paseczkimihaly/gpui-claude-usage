@@ -457,11 +457,19 @@ mod win {
     static MARGIN: AtomicI32 = AtomicI32::new(0);
     static SNAP: AtomicI32 = AtomicI32::new(0);
     static GPUI_PROC: AtomicIsize = AtomicIsize::new(0);
+    static GRAB: (AtomicI32, AtomicI32) = (AtomicI32::new(0), AtomicI32::new(0)); // cursor offset in the window
 
     /// Wraps GPUI's window procedure to snap the rect live during the native drag loop.
     unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
         match msg {
-            WM_ENTERSIZEMOVE => MOVING.store(true, Relaxed),
+            WM_ENTERSIZEMOVE => unsafe {
+                MOVING.store(true, Relaxed);
+                let (mut pt, mut r) = (POINT::default(), RECT::default());
+                let _ = GetCursorPos(&mut pt);
+                let _ = GetWindowRect(h, &mut r);
+                GRAB.0.store(pt.x - r.left, Relaxed);
+                GRAB.1.store(pt.y - r.top, Relaxed);
+            },
             WM_EXITSIZEMOVE => {
                 MOVING.store(false, Relaxed);
                 DROPPED.store(true, Relaxed);
@@ -474,8 +482,11 @@ mod win {
                 // the cursor's monitor, so the widget can still be dragged to another screen
                 if GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
                     let w = mi.rcWork;
+                    // position from the cursor, not from `r`: Windows derives `r` from the last
+                    // (already snapped) rect, so snapping it would never let go of an edge
+                    let (x, y) = (pt.x - GRAB.0.load(Relaxed), pt.y - GRAB.1.load(Relaxed));
                     let m = super::magnet(
-                        (r.left, r.top, r.right, r.bottom),
+                        (x, y, x + r.right - r.left, y + r.bottom - r.top),
                         (w.left, w.top, w.right, w.bottom),
                         MARGIN.load(Relaxed),
                         SNAP.load(Relaxed),
