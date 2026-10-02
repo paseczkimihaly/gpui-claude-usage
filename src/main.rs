@@ -2,8 +2,9 @@
 
 use chrono::{DateTime, Local, NaiveDate};
 use gpui::{
-    App, Application, Bounds, MouseButton, Context, Hsla, Window, WindowBounds, WindowControlArea, WindowKind,
-    WindowOptions, div, prelude::*, px, rgb, size,
+    App, Application, Bounds, Context, Hsla, MouseButton, Rgba, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowKind, WindowOptions, div, prelude::*, px, rgb, rgba,
+    size,
 };
 use serde_json::Value;
 use std::{
@@ -14,32 +15,23 @@ use std::{
 
 const DAYS: usize = 7;
 const REFRESH: Duration = Duration::from_secs(60);
+const TICK: Duration = Duration::from_millis(150);
+const FULL_W: f32 = 232.;
+const MINI_W: f32 = 96.;
+const SNAP_DIST: f32 = 48.; // drop within this of a screen edge to dock
+const MARGIN: f32 = 8.; // gap between a stuck widget and the screen edge
+const ORANGE: u32 = 0xe8875f;
 
-#[derive(Default, Clone, Copy)]
-struct Day {
-    input: u64,
-    output: u64,
-    cache_write: u64,
-    cache_read: u64,
-}
-
-impl Day {
-    fn total(&self) -> u64 {
-        self.input + self.output + self.cache_write + self.cache_read
-    }
-}
-
-#[derive(Default)]
 struct Limit {
+    label: String,
     pct: f64,
     resets: Option<DateTime<Local>>,
 }
 
 #[derive(Default)]
 struct Stats {
-    days: [Day; DAYS], // index 0 = 6 days ago, last = today
-    five_hour: Option<Limit>,
-    seven_day: Option<Limit>,
+    days: [u64; DAYS], // tokens per day; index 0 = 6 days ago, last = today
+    limits: Vec<Limit>,
     limit_err: Option<String>,
 }
 
@@ -64,7 +56,7 @@ fn jsonl_files(dir: &Path, since: SystemTime, out: &mut Vec<PathBuf>) {
 
 /// Adds one log line's usage to `days`. Streaming writes the same message several
 /// times (and resumed sessions copy history), so `seen` dedupes by message id.
-fn add_line(line: &str, today: NaiveDate, seen: &mut HashSet<String>, days: &mut [Day; DAYS]) {
+fn add_line(line: &str, today: NaiveDate, seen: &mut HashSet<String>, days: &mut [u64; DAYS]) {
     if !line.contains("\"usage\"") {
         return;
     }
@@ -77,20 +69,18 @@ fn add_line(line: &str, today: NaiveDate, seen: &mut HashSet<String>, days: &mut
         return;
     }
     let u = &msg["usage"];
-    let n = |k: &str| u[k].as_u64().unwrap_or(0);
-    let d = &mut days[DAYS - 1 - age as usize];
-    d.input += n("input_tokens");
-    d.output += n("output_tokens");
-    d.cache_write += n("cache_creation_input_tokens");
-    d.cache_read += n("cache_read_input_tokens");
+    days[DAYS - 1 - age as usize] += ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"]
+        .iter()
+        .map(|k| u[k].as_u64().unwrap_or(0))
+        .sum::<u64>();
 }
 
-fn local_usage() -> [Day; DAYS] {
+fn local_usage() -> [u64; DAYS] {
     let since = SystemTime::now() - Duration::from_secs(86400 * (DAYS as u64 + 1));
     let mut files = Vec::new();
     jsonl_files(&claude_dir().join("projects"), since, &mut files);
     let today = Local::now().date_naive();
-    let (mut seen, mut days) = (HashSet::new(), [Day::default(); DAYS]);
+    let (mut seen, mut days) = (HashSet::new(), [0; DAYS]);
     for f in files {
         // ponytail: re-reads ~a week of logs every poll; cache per-file (mtime, len) if it gets slow
         let Ok(text) = std::fs::read_to_string(&f) else { continue };
@@ -101,9 +91,35 @@ fn local_usage() -> [Day; DAYS] {
     days
 }
 
+/// Every `{utilization, resets_at}` entry: five_hour, seven_day, and per-model
+/// weekly ones (seven_day_opus, seven_day_fable, ...), in that order.
+fn parse_limits(body: &Value) -> Vec<Limit> {
+    let Some(map) = body.as_object() else { return vec![] };
+    let mut out: Vec<(u8, Limit)> = map
+        .iter()
+        .filter_map(|(k, l)| {
+            let (rank, label) = match k.as_str() {
+                "five_hour" => (0, "5h".to_string()),
+                "seven_day" => (1, "Week".to_string()),
+                k => {
+                    let m = k.strip_prefix("seven_day_").filter(|m| !m.contains('_'))?;
+                    (2, m[..1].to_uppercase() + &m[1..])
+                }
+            };
+            let resets = l["resets_at"]
+                .as_str()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&Local));
+            Some((rank, Limit { label, pct: l["utilization"].as_f64()?, resets }))
+        })
+        .collect();
+    out.sort_by_key(|(r, _)| *r);
+    out.into_iter().map(|(_, l)| l).collect()
+}
+
 /// Plan rate limits via the same (unofficial) endpoint Claude Code's /usage uses.
 /// Re-reads the token every call since Claude Code refreshes it.
-fn plan_limits() -> Result<(Option<Limit>, Option<Limit>), String> {
+fn plan_limits() -> Result<Vec<Limit>, String> {
     let creds = std::fs::read_to_string(claude_dir().join(".credentials.json"))
         .map_err(|_| "no credentials (log in to Claude Code)")?;
     let creds: Value = serde_json::from_str(&creds).map_err(|e| e.to_string())?;
@@ -114,44 +130,100 @@ fn plan_limits() -> Result<(Option<Limit>, Option<Limit>), String> {
         .call()
         .and_then(|mut r| r.body_mut().read_to_string())
         .map_err(|e| e.to_string())?;
-    let body: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    let limit = |k: &str| {
-        let l = &body[k];
-        Some(Limit {
-            pct: l["utilization"].as_f64()?,
-            resets: l["resets_at"]
-                .as_str()
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|t| t.with_timezone(&Local)),
-        })
-    };
-    Ok((limit("five_hour"), limit("seven_day")))
+    Ok(parse_limits(&serde_json::from_str(&body).map_err(|e| e.to_string())?))
 }
 
 fn fetch() -> Stats {
     let mut s = Stats { days: local_usage(), ..Default::default() };
     match plan_limits() {
-        Ok((a, b)) => (s.five_hour, s.seven_day) = (a, b),
+        Ok(l) => s.limits = l,
         Err(e) => s.limit_err = Some(e),
     }
     s
 }
 
-fn fmt_tokens(n: u64) -> String {
-    match n {
-        0..1_000 => n.to_string(),
-        1_000..1_000_000 => format!("{:.1}K", n as f64 / 1e3),
-        1_000_000..1_000_000_000 => format!("{:.1}M", n as f64 / 1e6),
-        _ => format!("{:.2}B", n as f64 / 1e9),
+fn fmt_until(t: DateTime<Local>) -> String {
+    let m = (t - Local::now()).num_minutes().max(0);
+    match m {
+        1440.. => format!("{}d {}h", m / 1440, m % 1440 / 60),
+        60.. => format!("{}h {}m", m / 60, m % 60),
+        _ => format!("{m}m"),
     }
+}
+
+fn level_color(pct: f64) -> Rgba {
+    match pct {
+        p if p >= 90.0 => rgb(0xf06a6a),
+        p if p >= 70.0 => rgb(0xf0b44c),
+        _ => rgb(ORANGE),
+    }
+}
+
+fn bar(l: &Limit) -> gpui::Div {
+    div().h(px(5.)).rounded_full().bg(rgba(0xffffff1a)).child(
+        div()
+            .h_full()
+            .rounded_full()
+            .bg(level_color(l.pct))
+            .w(gpui::relative((l.pct / 100.0).clamp(0.0, 1.0) as f32)),
+    )
+}
+
+fn dim() -> Hsla {
+    rgb(0x9aa0aa).into()
+}
+
+/// Where a docked widget sits on one axis: against the start/end edge, or at a fixed coordinate.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Pin {
+    Start,
+    End,
+    At(i32),
+}
+
+/// Screen rect in physical pixels: (left, top, right, bottom).
+type Rect = (i32, i32, i32, i32);
+
+/// Docks to whichever screen edges the window was dropped near (one edge, or two in a corner).
+fn near_edges(w: Rect, work: Rect, dist: i32) -> Option<(Pin, Pin)> {
+    // window edges lo/hi against work-area edges wlo/whi
+    let pin = |lo: i32, hi: i32, wlo: i32, whi: i32| {
+        if (lo - wlo).abs() <= dist {
+            Some(Pin::Start)
+        } else if (whi - hi).abs() <= dist {
+            Some(Pin::End)
+        } else {
+            None
+        }
+    };
+    let x = pin(w.0, w.2, work.0, work.2);
+    let y = pin(w.1, w.3, work.1, work.3);
+    (x.is_some() || y.is_some()).then(|| (x.unwrap_or(Pin::At(w.0)), y.unwrap_or(Pin::At(w.1))))
+}
+
+/// Rect of size w×h pinned per `dock`, kept inside the work area with margin `m`.
+fn anchored(dock: (Pin, Pin), work: Rect, w: i32, h: i32, m: i32) -> Rect {
+    let place = |p: Pin, lo: i32, hi: i32, len: i32| match p {
+        Pin::Start => lo + m,
+        Pin::End => hi - m - len,
+        Pin::At(v) => v.clamp(lo + m, (hi - m - len).max(lo + m)),
+    };
+    let (x, y) = (place(dock.0, work.0, work.2, w), place(dock.1, work.1, work.3, h));
+    (x, y, x + w, y + h)
 }
 
 struct Widget {
     stats: Option<Stats>,
+    #[cfg(windows)]
+    hwnd: Option<win::HWND>,
+    last_rect: Option<Rect>,
+    settled: bool,
+    dock: Option<(Pin, Pin)>,
+    mini: bool,
 }
 
 impl Widget {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.spawn(async move |this, cx| {
             loop {
                 let stats = cx.background_executor().spawn(async { fetch() }).await;
@@ -162,163 +234,232 @@ impl Widget {
             }
         })
         .detach();
-        Self { stats: None }
+        // ponytail: polls window position/hover instead of hooking WM_EXITSIZEMOVE; fine at 150ms
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(TICK).await;
+                let Ok(place) = this.update_in(cx, |w, window, cx| w.tick(window, cx)) else { break };
+                // move/resize only after the update returns: GPUI drops the resize event
+                // if it arrives mid-update, leaving the layout at the old size
+                if let Some(place) = place {
+                    place();
+                }
+            }
+        })
+        .detach();
+        Self {
+            stats: None,
+            #[cfg(windows)]
+            hwnd: win::init(window),
+            last_rect: None,
+            settled: false,
+            dock: None,
+            mini: false,
+        }
     }
-}
 
-fn dim() -> Hsla {
-    rgb(0x8a8f98).into()
-}
+    fn rows(&self) -> f32 {
+        self.stats.as_ref().map_or(2, |s| s.limits.len().max(1)) as f32
+    }
 
-fn limit_row(label: &str, l: &Option<Limit>) -> impl IntoElement {
-    let (pct, resets) = match l {
-        Some(l) => (l.pct, l.resets.map(|t| t.format(" · resets %a %H:%M").to_string()).unwrap_or_default()),
-        None => (0.0, " · n/a".into()),
-    };
-    let color = match pct {
-        p if p >= 90.0 => rgb(0xe5534b),
-        p if p >= 70.0 => rgb(0xe0a63a),
-        _ => rgb(0xd97757),
-    };
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .flex()
-                .justify_between()
-                .child(format!("{label}{resets}"))
-                .child(div().text_color(dim()).child(format!("{pct:.0}%"))),
-        )
-        .child(
-            div().h(px(6.)).w_full().rounded_full().bg(rgb(0x2b2d31)).child(
-                div().h_full().rounded_full().bg(color).w(gpui::relative((pct / 100.0).clamp(0.0, 1.0) as f32)),
-            ),
-        )
+    fn full_h(&self) -> f32 {
+        112. + 22. * self.rows()
+    }
+
+    fn mini_h(&self) -> f32 {
+        16. + 5. * self.rows() + 4. * (self.rows() - 1.) // padding + bars + gaps
+    }
+
+    /// Dock to nearby screen edges once a drag ends; while docked, shrink to the pill unless hovered.
+    #[cfg(windows)]
+    fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<Box<dyn FnOnce()>> {
+        let hwnd = self.hwnd?;
+        let (cur, work) = win::rects(hwnd)?;
+        if self.last_rect != Some(cur) {
+            (self.last_rect, self.settled) = (Some(cur), false); // still moving
+            return None;
+        }
+        let s = window.scale_factor();
+        if !self.settled {
+            self.settled = true;
+            self.dock = near_edges(cur, work, (SNAP_DIST * s) as i32);
+        }
+        let mini = self.dock.is_some() && !window.is_window_hovered();
+        let (w, h) = if mini { (MINI_W, self.mini_h()) } else { (FULL_W, self.full_h()) };
+        let (w, h) = ((w * s).round() as i32, (h * s).round() as i32);
+        let target = match self.dock {
+            Some(c) => anchored(c, work, w, h, (MARGIN * s) as i32),
+            None => (cur.0, cur.1, cur.0 + w, cur.1 + h),
+        };
+        if mini != self.mini {
+            self.mini = mini;
+            cx.notify();
+        }
+        (target != cur).then(|| {
+            self.last_rect = Some(target);
+            Box::new(move || win::place(hwnd, target)) as Box<dyn FnOnce()>
+        })
+    }
+
+    #[cfg(not(windows))]
+    fn tick(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<Box<dyn FnOnce()>> {
+        None // ponytail: edge docking is Windows-only
+    }
+
+    /// Docked: just the limit bars.
+    fn render_mini(&self) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap(px(4.))
+            .p(px(8.))
+            .children(self.stats.iter().flat_map(|s| &s.limits).map(|l| bar(l).w_full()))
+    }
+
+    fn render_full(&self, s: &Stats) -> impl IntoElement {
+        let max = s.days.iter().copied().max().unwrap_or(0).max(1);
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().flex().flex_col().gap(px(6.)).children(s.limits.iter().map(|l| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(16.))
+                    .child(div().w(px(38.)).text_color(dim()).child(l.label.clone()))
+                    .child(bar(l).flex_1().h(px(6.)))
+                    .child(div().w(px(30.)).flex().justify_end().child(format!("{:.0}%", l.pct)))
+                    .child(
+                        div()
+                            .w(px(44.))
+                            .flex()
+                            .justify_end()
+                            .text_color(dim())
+                            .child(l.resets.map(fmt_until).unwrap_or_default()),
+                    )
+            })))
+            .children(s.limit_err.as_ref().map(|e| div().text_color(rgb(0xf06a6a)).child(format!("limits: {e}"))))
+            .child(div().flex().items_end().gap(px(3.)).h(px(32.)).children(
+                s.days.iter().enumerate().map(|(i, d)| {
+                    div()
+                        .flex_1()
+                        .rounded(px(3.))
+                        .bg(if i == DAYS - 1 { rgb(ORANGE).into() } else { rgba(0xffffff40) })
+                        .h(px(3. + 29. * *d as f32 / max as f32))
+                }),
+            ))
+    }
 }
 
 impl Render for Widget {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let root = div()
-            .size_full()
-            .flex()
+        let root = div().size_full().bg(rgba(0x16171bb8)).text_color(rgb(0xf0f0f2)).text_xs();
+        if self.mini {
+            return root.child(self.render_mini()).into_any_element();
+        }
+        root.flex()
             .flex_col()
-            .gap_3()
-            .p_3()
-            .bg(rgb(0x1b1c1f))
-            .border_1()
-            .border_color(rgb(0x33353a))
-            .text_color(rgb(0xe6e6e6))
-            .text_xs()
+            .gap_2()
+            .px_3()
+            .py(px(10.))
             .child(
                 div()
                     .flex()
+                    .items_center()
                     .child(
                         // drag by the header only: a whole-window drag area would swallow the ✕ click
                         div()
                             .flex_1()
                             .text_sm()
-                            .text_color(rgb(0xd97757))
+                            .text_color(rgb(ORANGE))
                             .window_control_area(WindowControlArea::Drag)
-                            .child("Claude usage"),
+                            .child("✻ Claude") // ✻ not ✳: the latter renders as a green emoji,
                     )
                     .child(
                         div()
                             .id("close")
                             .px_1()
+                            .rounded_full()
                             .text_color(dim())
-                            .hover(|s| s.text_color(rgb(0xffffff)))
                             .cursor_pointer()
+                            .hover(|s| s.text_color(rgb(0xffffff)).bg(rgba(0xffffff1a)))
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.quit())
                             .child("✕"),
                     ),
-            );
-        let Some(s) = &self.stats else {
-            return root.child(div().text_color(dim()).child("Loading…"));
-        };
-
-        let today = s.days[DAYS - 1];
-        let week = s.days.iter().fold(Day::default(), |a, d| Day {
-            input: a.input + d.input,
-            output: a.output + d.output,
-            cache_write: a.cache_write + d.cache_write,
-            cache_read: a.cache_read + d.cache_read,
-        });
-        let max = s.days.iter().map(Day::total).max().unwrap_or(0).max(1);
-        let tok_col = |label: &str, d: Day| {
-            div()
-                .flex()
-                .flex_col()
-                .child(div().text_color(dim()).child(label.to_string()))
-                .child(div().text_lg().child(fmt_tokens(d.total())))
-                .child(div().text_color(dim()).child(format!("{} out", fmt_tokens(d.output))))
-        };
-        let today_date = Local::now().date_naive();
-
-        root.child(limit_row("5-hour", &s.five_hour))
-            .child(limit_row("Weekly", &s.seven_day))
-            .children(s.limit_err.as_ref().map(|e| div().text_color(rgb(0xe5534b)).child(format!("limits: {e}"))))
-            .child(div().flex().gap_6().child(tok_col("Today", today)).child(tok_col("7 days", week)))
-            .child(
-                div().flex().items_end().gap_1().h(px(56.)).children(s.days.iter().enumerate().map(|(i, d)| {
-                    let date = today_date - chrono::Days::new((DAYS - 1 - i) as u64);
-                    div()
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .justify_end()
-                        .h_full()
-                        .gap_1()
-                        .child(
-                            div()
-                                .w_full()
-                                .rounded_sm()
-                                .bg(if i == DAYS - 1 { rgb(0xd97757) } else { rgb(0x5a5e66) })
-                                .h(px(2. + 38. * d.total() as f32 / max as f32)),
-                        )
-                        .child(div().text_color(dim()).child(date.format("%a").to_string()))
-                })),
             )
+            .child(match &self.stats {
+                Some(s) => self.render_full(s).into_any_element(),
+                None => div().text_color(dim()).child("Loading…").into_any_element(),
+            })
+            .into_any_element()
     }
 }
 
-/// GPUI's Windows PopUp has no topmost flag, so set it directly.
 #[cfg(windows)]
-fn make_topmost(window: &Window) {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn SetWindowPos(hwnd: isize, after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
+mod win {
+    pub use windows::Win32::Foundation::HWND;
+    use windows::Win32::{
+        Foundation::RECT,
+        Graphics::{Dwm::*, Gdi::*},
+        UI::WindowsAndMessaging::*,
+    };
+
+    /// GPUI's PopUp kind isn't topmost on Windows, and DWM rounds the corners (blur included).
+    pub fn init(window: &gpui::Window) -> Option<HWND> {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let RawWindowHandle::Win32(h) = HasWindowHandle::window_handle(window).ok()?.as_raw() else {
+            return None;
+        };
+        let hwnd = HWND(h.hwnd.get() as _);
+        unsafe {
+            let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            let pref = DWMWCP_ROUND;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &pref as *const _ as _,
+                size_of_val(&pref) as u32,
+            );
+        }
+        Some(hwnd)
     }
-    const HWND_TOPMOST: isize = -1;
-    const SWP_NOSIZE_NOMOVE_NOACTIVATE: u32 = 0x1 | 0x2 | 0x10;
-    if let Ok(h) = HasWindowHandle::window_handle(window)
-        && let RawWindowHandle::Win32(h) = h.as_raw()
-    {
-        unsafe { SetWindowPos(h.hwnd.get(), HWND_TOPMOST, 0, 0, 0, 0, SWP_NOSIZE_NOMOVE_NOACTIVATE) };
+
+    /// (window rect, work area of its monitor) in physical pixels.
+    pub fn rects(hwnd: HWND) -> Option<(super::Rect, super::Rect)> {
+        let t = |r: RECT| (r.left, r.top, r.right, r.bottom);
+        unsafe {
+            let mut r = RECT::default();
+            GetWindowRect(hwnd, &mut r).ok()?;
+            let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+            GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi).ok().ok()?;
+            Some((t(r), t(mi.rcWork)))
+        }
+    }
+
+    pub fn place(hwnd: HWND, r: super::Rect) {
+        unsafe {
+            let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), r.0, r.1, r.2 - r.0, r.3 - r.1, SWP_NOACTIVATE);
+        }
     }
 }
-
-#[cfg(not(windows))]
-fn make_topmost(_: &Window) {} // PopUp kind is already topmost on macOS/Linux
 
 fn main() {
     Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(300.), px(290.)), cx);
+        let bounds = Bounds::centered(None, size(px(FULL_W), px(178.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: None,
                 kind: WindowKind::PopUp,
                 is_resizable: false,
+                window_background: WindowBackgroundAppearance::Blurred,
                 ..Default::default()
             },
-            |window, cx| {
-                make_topmost(window);
-                cx.new(Widget::new)
-            },
+            |window, cx| cx.new(|cx| Widget::new(window, cx)),
         )
         .unwrap();
     });
@@ -335,14 +476,36 @@ mod tests {
         let line = format!(
             r#"{{"timestamp":"{ts}","message":{{"id":"m1","usage":{{"input_tokens":2,"output_tokens":10,"cache_creation_input_tokens":100,"cache_read_input_tokens":1000}}}}}}"#
         );
-        let (mut seen, mut days) = (HashSet::new(), [Day::default(); DAYS]);
+        let (mut seen, mut days) = (HashSet::new(), [0; DAYS]);
         add_line(&line, today, &mut seen, &mut days);
         add_line(&line, today, &mut seen, &mut days); // duplicate ignored
-        assert_eq!(days[DAYS - 1].total(), 1112);
-        assert_eq!(days[DAYS - 1].output, 10);
+        assert_eq!(days[DAYS - 1], 1112);
         // too old → ignored
         add_line(&line.replace("m1", "m2"), today + chrono::Days::new(DAYS as u64), &mut seen, &mut days);
-        assert_eq!(days.iter().map(Day::total).sum::<u64>(), 1112);
-        assert_eq!(fmt_tokens(1_500_000), "1.5M");
+        assert_eq!(days.iter().sum::<u64>(), 1112);
+    }
+
+    #[test]
+    fn limits_ordered_and_filtered() {
+        let body: Value = serde_json::from_str(
+            r#"{"seven_day_fable":{"utilization":5,"resets_at":null},"seven_day":{"utilization":24.0},
+                "five_hour":{"utilization":11.0},"seven_day_opus":null,"seven_day_oauth_apps":{"utilization":1},
+                "extra_usage":{"is_enabled":false}}"#,
+        )
+        .unwrap();
+        let labels: Vec<_> = parse_limits(&body).into_iter().map(|l| l.label).collect();
+        assert_eq!(labels, ["5h", "Week", "Fable"]);
+    }
+
+    #[test]
+    fn edge_docking() {
+        let work = (0, 0, 1920, 1040);
+        let d = near_edges((1700, 900, 1900, 1030), work, 48);
+        assert_eq!(d, Some((Pin::End, Pin::End))); // bottom-right corner
+        assert_eq!(anchored(d.unwrap(), work, 100, 30, 8), (1812, 1002, 1912, 1032));
+        let d = near_edges((1700, 400, 1910, 600), work, 48);
+        assert_eq!(d, Some((Pin::End, Pin::At(400)))); // right edge, keeps its height
+        assert_eq!(anchored(d.unwrap(), work, 100, 900, 8), (1812, 132, 1912, 1032)); // clamped on screen
+        assert_eq!(near_edges((500, 500, 700, 700), work, 48), None);
     }
 }
