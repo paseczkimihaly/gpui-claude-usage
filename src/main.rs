@@ -10,11 +10,13 @@ use serde_json::Value;
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 const DAYS: usize = 7;
-const REFRESH: Duration = Duration::from_secs(60);
+const REFRESH: Duration = Duration::from_secs(60); // local logs
+const LIMITS_EVERY: Duration = Duration::from_secs(300); // usage endpoint rate-limits (429) if polled faster
+const LIMITS_MAX_BACKOFF: Duration = Duration::from_secs(1800);
 const TICK: Duration = Duration::from_millis(150);
 const FULL_W: f32 = 232.;
 const MINI_W: f32 = 96.;
@@ -22,6 +24,7 @@ const SNAP_DIST: f32 = 48.; // drop within this of a screen edge to dock
 const MARGIN: f32 = 8.; // gap between a stuck widget and the screen edge
 const ORANGE: u32 = 0xe8875f;
 
+#[derive(Clone)]
 struct Limit {
     label: String,
     pct: f64,
@@ -133,15 +136,6 @@ fn plan_limits() -> Result<Vec<Limit>, String> {
     Ok(parse_limits(&serde_json::from_str(&body).map_err(|e| e.to_string())?))
 }
 
-fn fetch() -> Stats {
-    let mut s = Stats { days: local_usage(), ..Default::default() };
-    match plan_limits() {
-        Ok(l) => s.limits = l,
-        Err(e) => s.limit_err = Some(e),
-    }
-    s
-}
-
 fn fmt_until(t: DateTime<Local>) -> String {
     let m = (t - Local::now()).num_minutes().max(0);
     match m {
@@ -225,8 +219,21 @@ struct Widget {
 impl Widget {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.spawn(async move |this, cx| {
+            // last good limits stay on screen when a fetch fails; errors back off 5→10→20→30 min
+            let (mut limits, mut err, mut next, mut backoff) = (vec![], None, Instant::now(), LIMITS_EVERY);
             loop {
-                let stats = cx.background_executor().spawn(async { fetch() }).await;
+                let poll = Instant::now() >= next;
+                let (days, res) =
+                    cx.background_executor().spawn(async move { (local_usage(), poll.then(plan_limits)) }).await;
+                match res {
+                    Some(Ok(l)) => (limits, err, next, backoff) = (l, None, Instant::now() + LIMITS_EVERY, LIMITS_EVERY),
+                    Some(Err(e)) => {
+                        (err, next) = (Some(e), Instant::now() + backoff);
+                        backoff = (backoff * 2).min(LIMITS_MAX_BACKOFF);
+                    }
+                    None => {}
+                }
+                let stats = Stats { days, limits: limits.clone(), limit_err: err.clone() };
                 if this.update(cx, |w, cx| { w.stats = Some(stats); cx.notify() }).is_err() {
                     break;
                 }
@@ -342,7 +349,10 @@ impl Widget {
                             .child(l.resets.map(fmt_until).unwrap_or_default()),
                     )
             })))
-            .children(s.limit_err.as_ref().map(|e| div().text_color(rgb(0xf06a6a)).child(format!("limits: {e}"))))
+            .children(s.limit_err.as_ref().filter(|_| s.limits.is_empty()).map(|e| {
+                let msg = if e.contains("429") { "rate limited, retrying in a few min".into() } else { format!("limits: {e}") };
+                div().text_color(rgb(0xf06a6a)).child(msg)
+            }))
             .child(div().flex().items_end().gap(px(3.)).h(px(32.)).children(
                 s.days.iter().enumerate().map(|(i, d)| {
                     div()
