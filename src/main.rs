@@ -17,10 +17,12 @@ const DAYS: usize = 7;
 const REFRESH: Duration = Duration::from_secs(60); // local logs
 const LIMITS_EVERY: Duration = Duration::from_secs(300); // usage endpoint rate-limits (429) if polled faster
 const LIMITS_MAX_BACKOFF: Duration = Duration::from_secs(1800);
-const TICK: Duration = Duration::from_millis(150);
+const TICK: Duration = Duration::from_millis(33);
+const HOVER_IN: Duration = Duration::from_millis(250); // dwell before a docked widget expands
+const HOVER_OUT: Duration = Duration::from_millis(350); // grace before it collapses again
 const FULL_W: f32 = 232.;
 const MINI_W: f32 = 96.;
-const SNAP_DIST: f32 = 48.; // drop within this of a screen edge to dock
+const SNAP_DIST: f32 = 32.; // edges pull the window in from this far while dragging
 const MARGIN: f32 = 8.; // gap between a stuck widget and the screen edge
 const ORANGE: u32 = 0xe8875f;
 
@@ -206,14 +208,29 @@ fn anchored(dock: (Pin, Pin), work: Rect, w: i32, h: i32, m: i32) -> Rect {
     (x, y, x + w, y + h)
 }
 
+/// Live snapping while dragging: an axis within `d` of a work-area edge (or past it)
+/// sticks to that edge, so the window slides along it until pulled more than `d` away.
+fn magnet(r: Rect, work: Rect, m: i32, d: i32) -> Rect {
+    let axis = |lo: i32, hi: i32, wlo: i32, whi: i32| {
+        if lo <= wlo + m + d {
+            wlo + m
+        } else if hi >= whi - m - d {
+            whi - m - (hi - lo)
+        } else {
+            lo
+        }
+    };
+    let (x, y) = (axis(r.0, r.2, work.0, work.2), axis(r.1, r.3, work.1, work.3));
+    (x, y, x + r.2 - r.0, y + r.3 - r.1)
+}
+
 struct Widget {
     stats: Option<Stats>,
     #[cfg(windows)]
     hwnd: Option<win::HWND>,
-    last_rect: Option<Rect>,
-    settled: bool,
     dock: Option<(Pin, Pin)>,
     mini: bool,
+    pending: Option<Instant>, // when the cursor started asking for an expand/collapse
 }
 
 impl Widget {
@@ -241,7 +258,7 @@ impl Widget {
             }
         })
         .detach();
-        // ponytail: polls window position/hover instead of hooking WM_EXITSIZEMOVE; fine at 150ms
+        // ponytail: polls the cursor for hover (GPUI's hover flag drops over drag areas); dragging itself is event-driven
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(TICK).await;
@@ -257,11 +274,10 @@ impl Widget {
         Self {
             stats: None,
             #[cfg(windows)]
-            hwnd: win::init(window),
-            last_rect: None,
-            settled: false,
+            hwnd: win::init(window, (MARGIN * window.scale_factor()) as i32, (SNAP_DIST * window.scale_factor()) as i32),
             dock: None,
             mini: false,
+            pending: None,
         }
     }
 
@@ -277,35 +293,50 @@ impl Widget {
         16. + 5. * self.rows() + 4. * (self.rows() - 1.) // padding + bars + gaps
     }
 
-    /// Dock to nearby screen edges once a drag ends; while docked, shrink to the pill unless hovered.
+    /// Docks when a drag ends against an edge; while docked, collapses to the bars unless hovered.
     #[cfg(windows)]
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<Box<dyn FnOnce()>> {
+        use std::sync::atomic::Ordering::Relaxed;
         let hwnd = self.hwnd?;
+        if win::MOVING.load(Relaxed) {
+            return None; // the WM_MOVING hook handles snapping live
+        }
         let (cur, work) = win::rects(hwnd)?;
-        if self.last_rect != Some(cur) {
-            (self.last_rect, self.settled) = (Some(cur), false); // still moving
-            return None;
-        }
         let s = window.scale_factor();
-        if !self.settled {
-            self.settled = true;
-            self.dock = near_edges(cur, work, (SNAP_DIST * s) as i32);
+        if win::DROPPED.swap(false, Relaxed) {
+            // the magnet already aligned it, so "near" just means touching the margin
+            self.dock = near_edges(cur, work, ((MARGIN + 2.) * s) as i32);
+            self.pending = None;
         }
-        let mini = self.dock.is_some() && !window.is_window_hovered();
+        let (inside, button) = win::cursor_in(cur);
+        // expand on hover, but not while the button is held: that press may be a drag of the bars
+        let want_mini = !inside || (self.mini && button);
+        let mini = if self.dock.is_none() {
+            false
+        } else if want_mini == self.mini {
+            self.pending = None;
+            self.mini
+        } else {
+            let since = *self.pending.get_or_insert_with(Instant::now);
+            let wait = if self.mini { HOVER_IN } else { HOVER_OUT };
+            if since.elapsed() >= wait {
+                self.pending = None;
+                want_mini
+            } else {
+                self.mini
+            }
+        };
         let (w, h) = if mini { (MINI_W, self.mini_h()) } else { (FULL_W, self.full_h()) };
         let (w, h) = ((w * s).round() as i32, (h * s).round() as i32);
         let target = match self.dock {
-            Some(c) => anchored(c, work, w, h, (MARGIN * s) as i32),
+            Some(d) => anchored(d, work, w, h, (MARGIN * s) as i32),
             None => (cur.0, cur.1, cur.0 + w, cur.1 + h),
         };
         if mini != self.mini {
             self.mini = mini;
             cx.notify();
         }
-        (target != cur).then(|| {
-            self.last_rect = Some(target);
-            Box::new(move || win::place(hwnd, target)) as Box<dyn FnOnce()>
-        })
+        (target != cur).then(|| Box::new(move || win::place(hwnd, target)) as Box<dyn FnOnce()>)
     }
 
     #[cfg(not(windows))]
@@ -322,6 +353,7 @@ impl Widget {
             .justify_center()
             .gap(px(4.))
             .p(px(8.))
+            .window_control_area(WindowControlArea::Drag) // drag the bars to slide along the edge
             .children(self.stats.iter().flat_map(|s| &s.limits).map(|l| bar(l).w_full()))
     }
 
@@ -412,14 +444,64 @@ impl Render for Widget {
 #[cfg(windows)]
 mod win {
     pub use windows::Win32::Foundation::HWND;
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering::Relaxed};
     use windows::Win32::{
-        Foundation::RECT,
+        Foundation::{LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::{Dwm::*, Gdi::*},
-        UI::WindowsAndMessaging::*,
+        UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
     };
 
-    /// GPUI's PopUp kind isn't topmost on Windows, and DWM rounds the corners (blur included).
-    pub fn init(window: &gpui::Window) -> Option<HWND> {
+    // ponytail: globals, since there's exactly one window
+    pub static MOVING: AtomicBool = AtomicBool::new(false);
+    pub static DROPPED: AtomicBool = AtomicBool::new(false);
+    static MARGIN: AtomicI32 = AtomicI32::new(0);
+    static SNAP: AtomicI32 = AtomicI32::new(0);
+    static GPUI_PROC: AtomicIsize = AtomicIsize::new(0);
+
+    /// Wraps GPUI's window procedure to snap the rect live during the native drag loop.
+    unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        match msg {
+            WM_ENTERSIZEMOVE => MOVING.store(true, Relaxed),
+            WM_EXITSIZEMOVE => {
+                MOVING.store(false, Relaxed);
+                DROPPED.store(true, Relaxed);
+            }
+            WM_MOVING => unsafe {
+                let r = &mut *(l.0 as *mut RECT);
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+                // the cursor's monitor, so the widget can still be dragged to another screen
+                if GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
+                    let w = mi.rcWork;
+                    let m = super::magnet(
+                        (r.left, r.top, r.right, r.bottom),
+                        (w.left, w.top, w.right, w.bottom),
+                        MARGIN.load(Relaxed),
+                        SNAP.load(Relaxed),
+                    );
+                    (r.left, r.top, r.right, r.bottom) = m;
+                }
+            },
+            _ => {}
+        }
+        unsafe { CallWindowProcW(std::mem::transmute(GPUI_PROC.load(Relaxed)), h, msg, w, l) }
+    }
+
+    /// (cursor inside `r`, left button held)
+    pub fn cursor_in(r: super::Rect) -> (bool, bool) {
+        let mut pt = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+            let inside = (r.0..r.2).contains(&pt.x) && (r.1..r.3).contains(&pt.y);
+            (inside, GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0)
+        }
+    }
+
+    /// Topmost (GPUI's PopUp kind isn't on Windows), DWM-rounded corners (blur included),
+    /// and the drag hook. `margin`/`snap` in physical px.
+    // ponytail: margin/snap use the starting monitor's DPI; recompute per monitor if mixed-DPI setups look off
+    pub fn init(window: &gpui::Window, margin: i32, snap: i32) -> Option<HWND> {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let RawWindowHandle::Win32(h) = HasWindowHandle::window_handle(window).ok()?.as_raw() else {
             return None;
@@ -434,6 +516,9 @@ mod win {
                 &pref as *const _ as _,
                 size_of_val(&pref) as u32,
             );
+            MARGIN.store(margin, Relaxed);
+            SNAP.store(snap, Relaxed);
+            GPUI_PROC.store(SetWindowLongPtrW(hwnd, GWLP_WNDPROC, proc as *const () as isize), Relaxed);
         }
         Some(hwnd)
     }
@@ -517,5 +602,10 @@ mod tests {
         assert_eq!(d, Some((Pin::End, Pin::At(400)))); // right edge, keeps its height
         assert_eq!(anchored(d.unwrap(), work, 100, 900, 8), (1812, 132, 1912, 1032)); // clamped on screen
         assert_eq!(near_edges((500, 500, 700, 700), work, 48), None);
+        // magnet: near/past the right edge sticks (sliding keeps y), far away is free
+        assert_eq!(magnet((1700, 300, 1900, 400), work, 8, 32), (1712, 300, 1912, 400));
+        assert_eq!(magnet((1800, 300, 2000, 400), work, 8, 32), (1712, 300, 1912, 400));
+        assert_eq!(magnet((1000, 300, 1200, 400), work, 8, 32), (1000, 300, 1200, 400));
+        assert_eq!(magnet((-50, -50, 150, 50), work, 8, 32), (8, 8, 208, 108));
     }
 }
