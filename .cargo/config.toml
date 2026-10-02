@@ -1,3 +1,7 @@
 [env]
 # Release builds compile shaders with fxc.exe from the Windows SDK; adjust for your SDK version.
 GPUI_FXC_PATH = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.17763.0\x64\fxc.exe'
+
+# Static C runtime so the exe has no vcruntime140.dll dependency.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

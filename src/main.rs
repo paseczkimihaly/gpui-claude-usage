@@ -1,6 +1,8 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // no console window in release
+
 use chrono::{DateTime, Local, NaiveDate};
 use gpui::{
-    App, Application, Bounds, Context, Hsla, Window, WindowBounds, WindowControlArea, WindowKind,
+    App, Application, Bounds, MouseButton, Context, Hsla, Window, WindowBounds, WindowControlArea, WindowKind,
     WindowOptions, div, prelude::*, px, rgb, size,
 };
 use serde_json::Value;
@@ -209,19 +211,26 @@ impl Render for Widget {
             .border_color(rgb(0x33353a))
             .text_color(rgb(0xe6e6e6))
             .text_xs()
-            .window_control_area(WindowControlArea::Drag)
             .child(
                 div()
                     .flex()
-                    .justify_between()
-                    .child(div().text_sm().text_color(rgb(0xd97757)).child("Claude usage"))
+                    .child(
+                        // drag by the header only: a whole-window drag area would swallow the ✕ click
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(rgb(0xd97757))
+                            .window_control_area(WindowControlArea::Drag)
+                            .child("Claude usage"),
+                    )
                     .child(
                         div()
                             .id("close")
                             .px_1()
                             .text_color(dim())
                             .hover(|s| s.text_color(rgb(0xffffff)))
-                            .window_control_area(WindowControlArea::Close)
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.quit())
                             .child("✕"),
                     ),
             );
