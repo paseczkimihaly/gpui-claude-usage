@@ -1,0 +1,1 @@
+A GPUI widget that shows your current claude usage and statistics.
