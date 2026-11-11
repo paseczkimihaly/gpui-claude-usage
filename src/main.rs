@@ -8,8 +8,11 @@ use gpui::{
 };
 use serde_json::Value;
 use std::{
-    collections::HashSet,
+    cell::Cell,
+    collections::{HashSet, VecDeque},
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
+    rc::Rc,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -22,9 +25,16 @@ const HOVER_IN: Duration = Duration::from_millis(250); // dwell before a docked 
 const HOVER_OUT: Duration = Duration::from_millis(350); // grace before it collapses again
 const FULL_W: f32 = 232.;
 const MINI_W: f32 = 96.;
+const MINI_BAR: f32 = 7.; // collapsed view: bar thickness
+const MINI_GAP: f32 = 2.; // collapsed view: space between bars
 const SNAP_DIST: f32 = 32.; // edges pull the window in from this far while dragging
 const MARGIN: f32 = 8.; // gap between a stuck widget and the screen edge
 const ORANGE: u32 = 0xe8875f;
+const NET_EVERY: Duration = Duration::from_secs(10);
+const NET_TIMEOUT: Duration = Duration::from_secs(2);
+const NET_HISTORY: usize = 30; // 5 minutes at NET_EVERY
+const NET_SLOW_MS: u32 = 300;
+const LIMITS_STALE: Duration = Duration::from_secs(60); // refetch on reconnect if older than this
 
 #[derive(Clone)]
 struct Limit {
@@ -38,11 +48,23 @@ struct Stats {
     days: [u64; DAYS], // tokens per day; index 0 = 6 days ago, last = today
     limits: Vec<Limit>,
     limit_err: Option<String>,
+    limits_at: Option<Instant>, // last successful limits fetch
+    email: Option<String>,
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default().into()
 }
 
 fn claude_dir() -> PathBuf {
-    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
-    Path::new(&home).join(".claude")
+    home_dir().join(".claude")
+}
+
+/// The logged-in account, from Claude Code's global config (next to, not inside, ~/.claude).
+fn account_email() -> Option<String> {
+    let text = std::fs::read_to_string(home_dir().join(".claude.json")).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    v["oauthAccount"]["emailAddress"].as_str().map(str::to_string)
 }
 
 fn jsonl_files(dir: &Path, since: SystemTime, out: &mut Vec<PathBuf>) {
@@ -138,6 +160,23 @@ fn plan_limits() -> Result<Vec<Limit>, String> {
     Ok(parse_limits(&serde_json::from_str(&body).map_err(|e| e.to_string())?))
 }
 
+/// Round-trip of a TCP handshake to Cloudflare's anycast DNS (fast everywhere, rarely down,
+/// and unlike ICMP it needs no special permissions and isn't dropped by firewalls).
+/// `None` = no connection within NET_TIMEOUT.
+fn ping() -> Option<u32> {
+    let t = Instant::now();
+    TcpStream::connect_timeout(&SocketAddr::from(([1, 1, 1, 1], 443)), NET_TIMEOUT).ok()?;
+    Some(t.elapsed().as_millis() as u32)
+}
+
+fn net_color(r: Option<u32>) -> Rgba {
+    match r {
+        None => rgb(0xf06a6a),
+        Some(ms) if ms >= NET_SLOW_MS => rgb(0xf0b44c),
+        Some(_) => rgb(0x5fbf77),
+    }
+}
+
 fn fmt_until(t: DateTime<Local>) -> String {
     let m = (t - Local::now()).num_minutes().max(0);
     match m {
@@ -226,6 +265,7 @@ fn magnet(r: Rect, work: Rect, m: i32, d: i32) -> Rect {
 
 struct Widget {
     stats: Option<Stats>,
+    net: VecDeque<Option<u32>>, // ping results, oldest first
     #[cfg(windows)]
     hwnd: Option<win::HWND>,
     dock: Option<(Pin, Pin)>,
@@ -235,26 +275,60 @@ struct Widget {
 
 impl Widget {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // set by the ping loop when the connection comes back, to fetch limits right away
+        let kick = Rc::new(Cell::new(false));
+        let k = kick.clone();
         cx.spawn(async move |this, cx| {
             // last good limits stay on screen when a fetch fails; errors back off 5→10→20→30 min
-            let (mut limits, mut err, mut next, mut backoff) = (vec![], None, Instant::now(), LIMITS_EVERY);
+            let (mut limits, mut err, mut next, mut backoff, mut at) = (vec![], None, Instant::now(), LIMITS_EVERY, None);
             loop {
-                let poll = Instant::now() >= next;
-                let (days, res) =
-                    cx.background_executor().spawn(async move { (local_usage(), poll.then(plan_limits)) }).await;
+                let poll = k.take() || Instant::now() >= next;
+                let (days, res, email) = cx
+                    .background_executor()
+                    .spawn(async move { (local_usage(), poll.then(plan_limits), account_email()) })
+                    .await;
                 match res {
-                    Some(Ok(l)) => (limits, err, next, backoff) = (l, None, Instant::now() + LIMITS_EVERY, LIMITS_EVERY),
+                    Some(Ok(l)) => {
+                        (limits, err, backoff, at) = (l, None, LIMITS_EVERY, Some(Instant::now()));
+                        next = Instant::now() + LIMITS_EVERY;
+                    }
                     Some(Err(e)) => {
                         (err, next) = (Some(e), Instant::now() + backoff);
                         backoff = (backoff * 2).min(LIMITS_MAX_BACKOFF);
                     }
                     None => {}
                 }
-                let stats = Stats { days, limits: limits.clone(), limit_err: err.clone() };
+                let stats = Stats { days, limits: limits.clone(), limit_err: err.clone(), limits_at: at, email };
                 if this.update(cx, |w, cx| { w.stats = Some(stats); cx.notify() }).is_err() {
                     break;
                 }
-                cx.background_executor().timer(REFRESH).await;
+                // sleep REFRESH, but wake early when the ping loop kicks
+                let wake = Instant::now() + REFRESH;
+                while Instant::now() < wake && !k.get() {
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                }
+            }
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                let r = cx.background_executor().spawn(async { ping() }).await;
+                let pushed = this.update(cx, |w, cx| {
+                    let restored = r.is_some() && w.net.back() == Some(&None);
+                    let stale = w.stats.as_ref().and_then(|s| s.limits_at).is_none_or(|t| t.elapsed() >= LIMITS_STALE);
+                    if restored && stale {
+                        kick.set(true);
+                    }
+                    if w.net.len() == NET_HISTORY {
+                        w.net.pop_front();
+                    }
+                    w.net.push_back(r);
+                    cx.notify()
+                });
+                if pushed.is_err() {
+                    break;
+                }
+                cx.background_executor().timer(NET_EVERY).await;
             }
         })
         .detach();
@@ -273,6 +347,7 @@ impl Widget {
         .detach();
         Self {
             stats: None,
+            net: VecDeque::with_capacity(NET_HISTORY),
             #[cfg(windows)]
             hwnd: win::init(window, (MARGIN * window.scale_factor()) as i32, (SNAP_DIST * window.scale_factor()) as i32),
             dock: None,
@@ -281,16 +356,31 @@ impl Widget {
         }
     }
 
+    /// The limits to draw, or empty placeholder bars ("ghosts") while none are available.
+    fn shown_limits(&self) -> (Vec<Limit>, bool) {
+        match self.stats.as_ref().map(|s| &s.limits).filter(|l| !l.is_empty()) {
+            Some(l) => (l.clone(), false),
+            None => (["5h", "Week"].map(|l| Limit { label: l.into(), pct: 0., resets: None }).to_vec(), true),
+        }
+    }
+
+    fn limit_err(&self) -> Option<&String> {
+        self.stats.as_ref().filter(|s| s.limits.is_empty())?.limit_err.as_ref()
+    }
+
     fn rows(&self) -> f32 {
-        self.stats.as_ref().map_or(2, |s| s.limits.len().max(1)) as f32
+        self.shown_limits().0.len() as f32
     }
 
     fn full_h(&self) -> f32 {
-        112. + 22. * self.rows()
+        let email = self.stats.as_ref().is_some_and(|s| s.email.is_some());
+        let line = |on: bool| if on { 24. } else { 0. }; // 16px line + gap
+        136. + 22. * self.rows() + line(email) + line(self.limit_err().is_some())
     }
 
     fn mini_h(&self) -> f32 {
-        16. + 5. * self.rows() + 4. * (self.rows() - 1.) // padding + bars + gaps
+        let n = self.rows() + 1.; // limit bars + net strip
+        16. + MINI_BAR * n + MINI_GAP * (n - 1.) // padding + bars + gaps
     }
 
     /// Docks when a drag ends against an edge; while docked, collapses to the bars unless hovered.
@@ -344,6 +434,41 @@ impl Widget {
         None // ponytail: edge docking is Windows-only
     }
 
+    /// One cell per ping, oldest left; unfilled slots are dim.
+    fn net_strip(&self, gap: gpui::Pixels) -> gpui::Div {
+        let empty = NET_HISTORY - self.net.len();
+        div().flex().gap(gap).children(
+            (0..empty)
+                .map(|_| rgba(0xffffff1a))
+                .chain(self.net.iter().map(|r| net_color(*r)))
+                .map(|c| div().flex_1().h_full().bg(c)),
+        )
+    }
+
+    /// Connectivity history: one cell per ping, newest on the right, latest latency at the end.
+    fn render_net(&self) -> impl IntoElement {
+        let latest = match self.net.back() {
+            Some(Some(ms)) => format!("{ms} ms"),
+            Some(None) => "offline".into(),
+            None => String::new(),
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(16.))
+            .child(div().w(px(38.)).text_color(dim()).child("Net"))
+            .child(self.net_strip(px(1.)).flex_1().h(px(8.)))
+            .child(
+                div()
+                    .w(px(48.))
+                    .flex()
+                    .justify_end()
+                    .text_color(self.net.back().map_or(dim(), |r| net_color(*r).into()))
+                    .child(latest),
+            )
+    }
+
     /// Docked: just the limit bars.
     fn render_mini(&self) -> impl IntoElement {
         div()
@@ -351,19 +476,23 @@ impl Widget {
             .flex()
             .flex_col()
             .justify_center()
-            .gap(px(4.))
+            .gap(px(MINI_GAP))
             .p(px(8.))
             .window_control_area(WindowControlArea::Drag) // drag the bars to slide along the edge
-            .children(self.stats.iter().flat_map(|s| &s.limits).map(|l| bar(l).w_full()))
+            .children(self.shown_limits().0.iter().map(|l| bar(l).w_full().h(px(MINI_BAR))))
+            .child(self.net_strip(px(0.)).w_full().h(px(MINI_BAR)))
     }
 
-    fn render_full(&self, s: &Stats) -> impl IntoElement {
-        let max = s.days.iter().copied().max().unwrap_or(0).max(1);
+    fn render_full(&self) -> impl IntoElement {
+        let (limits, ghost) = self.shown_limits();
+        let days = self.stats.as_ref().map_or([0; DAYS], |s| s.days);
+        let max = days.iter().copied().max().unwrap_or(0).max(1);
         div()
             .flex()
             .flex_col()
             .gap_2()
-            .child(div().flex().flex_col().gap(px(6.)).children(s.limits.iter().map(|l| {
+            .children(self.stats.as_ref().and_then(|s| s.email.clone()).map(|e| div().h(px(16.)).truncate().text_color(dim()).child(e)))
+            .child(div().flex().flex_col().gap(px(6.)).children(limits.iter().map(|l| {
                 div()
                     .flex()
                     .items_center()
@@ -371,7 +500,14 @@ impl Widget {
                     .h(px(16.))
                     .child(div().w(px(38.)).text_color(dim()).child(l.label.clone()))
                     .child(bar(l).flex_1().h(px(6.)))
-                    .child(div().w(px(30.)).flex().justify_end().child(format!("{:.0}%", l.pct)))
+                    .child(
+                        div()
+                            .w(px(30.))
+                            .flex()
+                            .justify_end()
+                            .text_color(if ghost { dim() } else { rgb(0xf0f0f2).into() })
+                            .child(if ghost { "–".into() } else { format!("{:.0}%", l.pct) }),
+                    )
                     .child(
                         div()
                             .w(px(44.))
@@ -381,12 +517,12 @@ impl Widget {
                             .child(l.resets.map(fmt_until).unwrap_or_default()),
                     )
             })))
-            .children(s.limit_err.as_ref().filter(|_| s.limits.is_empty()).map(|e| {
+            .children(self.limit_err().map(|e| {
                 let msg = if e.contains("429") { "rate limited, retrying in a few min".into() } else { format!("limits: {e}") };
-                div().text_color(rgb(0xf06a6a)).child(msg)
+                div().h(px(16.)).truncate().text_color(rgb(0xf06a6a)).child(msg)
             }))
             .child(div().flex().items_end().gap(px(3.)).h(px(32.)).children(
-                s.days.iter().enumerate().map(|(i, d)| {
+                days.iter().enumerate().map(|(i, d)| {
                     div()
                         .flex_1()
                         .rounded(px(3.))
@@ -421,6 +557,7 @@ impl Render for Widget {
                             .window_control_area(WindowControlArea::Drag)
                             .child("✻ Claude") // ✻ not ✳: the latter renders as a green emoji,
                     )
+                    .child(div().px_1().text_color(dim()).child(concat!("v", env!("CARGO_PKG_VERSION"))))
                     .child(
                         div()
                             .id("close")
@@ -433,10 +570,8 @@ impl Render for Widget {
                             .child("✕"),
                     ),
             )
-            .child(match &self.stats {
-                Some(s) => self.render_full(s).into_any_element(),
-                None => div().text_color(dim()).child("Loading…").into_any_element(),
-            })
+            .child(self.render_full())
+            .child(self.render_net())
             .into_any_element()
     }
 }
@@ -555,7 +690,7 @@ mod win {
 
 fn main() {
     Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(FULL_W), px(178.)), cx);
+        let bounds = Bounds::centered(None, size(px(FULL_W), px(202.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),

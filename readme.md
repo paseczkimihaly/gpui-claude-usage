@@ -20,7 +20,7 @@ cargo run --release  # release build, no console
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
-This produces a single standalone exe at `dist\claude-usage.exe`. If the widget is already running, the script closes it first.
+This produces a single standalone exe at `dist\claude-usage-<version>.exe`, with the version taken from `Cargo.toml` (also shown in the widget's header). Bump `version` in `Cargo.toml` before building a new release. If the widget is already running, the script closes it first.
 
 ## Test
 
