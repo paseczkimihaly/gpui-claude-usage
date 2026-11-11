@@ -263,8 +263,95 @@ fn magnet(r: Rect, work: Rect, m: i32, d: i32) -> Rect {
     (x, y, x + r.2 - r.0, y + r.3 - r.1)
 }
 
+/// "Start with Windows": a value under HKCU's Run key pointing at this exe (per-user, no admin).
+#[cfg(windows)]
+mod autostart {
+    use windows::{
+        Win32::System::Registry::*,
+        core::{PCWSTR, w},
+    };
+    const RUN: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
+    // where Task Manager / Settings > Startup apps record a user's disable
+    const APPROVED: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run");
+    const NAME: PCWSTR = w!("ClaudeUsage");
+
+    fn read(key: PCWSTR, flags: REG_ROUTINE_FLAGS, buf: &mut [u8]) -> Option<usize> {
+        let mut len = buf.len() as u32;
+        unsafe { RegGetValueW(HKEY_CURRENT_USER, key, NAME, flags, None, Some(buf.as_mut_ptr() as _), Some(&mut len)) }
+            .ok()
+            .ok()?;
+        Some(len as usize)
+    }
+
+    /// The registered command line, if any.
+    fn registered() -> Option<String> {
+        let mut buf = [0u8; 2048];
+        let len = read(RUN, RRF_RT_REG_SZ, &mut buf)?;
+        let wide: Vec<u16> = buf[..len].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        Some(String::from_utf16_lossy(&wide).trim_end_matches('\0').to_string())
+    }
+
+    fn command() -> Option<String> {
+        Some(format!("\"{}\"", std::env::current_exe().ok()?.display()))
+    }
+
+    pub fn enabled() -> bool {
+        // StartupApproved's first byte is even when allowed, odd when the user disabled it
+        let mut b = [0u8; 16];
+        let disabled = read(APPROVED, RRF_RT_REG_BINARY, &mut b).is_some_and(|n| n > 0 && b[0] & 1 == 1);
+        registered().is_some() && !disabled
+    }
+
+    fn write(cmd: &str) {
+        let data: Vec<u16> = cmd.encode_utf16().chain([0]).collect();
+        unsafe {
+            let _ = RegSetKeyValueW(HKEY_CURRENT_USER, RUN, NAME, REG_SZ.0, Some(data.as_ptr() as _), (data.len() * 2) as u32);
+        }
+    }
+
+    pub fn set(on: bool) {
+        match (on, command()) {
+            (true, Some(cmd)) => write(&cmd),
+            _ => unsafe {
+                let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN, NAME);
+            },
+        }
+        // clear a Task Manager disable, so the switch alone decides
+        unsafe {
+            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, APPROVED, NAME);
+        }
+    }
+
+    /// Re-points an existing entry at this exe, so a new versioned build takes over after an upgrade.
+    pub fn refresh() {
+        if let (Some(r), Some(cmd)) = (registered(), command()) {
+            if r != cmd {
+                write(&cmd);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod autostart {
+    pub fn enabled() -> bool {
+        false
+    }
+    pub fn set(_: bool) {}
+    pub fn refresh() {}
+}
+
+/// A small on/off switch.
+fn switch(on: bool) -> gpui::Div {
+    let track = div().w(px(24.)).h(px(14.)).p(px(2.)).rounded_full().flex();
+    let track = if on { track.justify_end().bg(rgb(ORANGE)) } else { track.bg(rgba(0xffffff26)) };
+    track.child(div().size(px(10.)).rounded_full().bg(rgb(0xf0f0f2)))
+}
+
 struct Widget {
     stats: Option<Stats>,
+    settings: bool, // settings panel open
+    autostart: bool,
     net: VecDeque<Option<u32>>, // ping results, oldest first
     #[cfg(windows)]
     hwnd: Option<win::HWND>,
@@ -345,8 +432,14 @@ impl Widget {
             }
         })
         .detach();
+        // release only: `cargo run` shouldn't steal the entry from the installed exe
+        if cfg!(not(debug_assertions)) {
+            autostart::refresh();
+        }
         Self {
             stats: None,
+            settings: false,
+            autostart: autostart::enabled(),
             net: VecDeque::with_capacity(NET_HISTORY),
             #[cfg(windows)]
             hwnd: win::init(window, (MARGIN * window.scale_factor()) as i32, (SNAP_DIST * window.scale_factor()) as i32),
@@ -375,7 +468,7 @@ impl Widget {
     fn full_h(&self) -> f32 {
         let email = self.stats.as_ref().is_some_and(|s| s.email.is_some());
         let line = |on: bool| if on { 24. } else { 0. }; // 16px line + gap
-        136. + 22. * self.rows() + line(email) + line(self.limit_err().is_some())
+        136. + 22. * self.rows() + line(email) + line(self.limit_err().is_some()) + line(self.settings)
     }
 
     fn mini_h(&self) -> f32 {
@@ -533,8 +626,29 @@ impl Widget {
     }
 }
 
+impl Widget {
+    fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("autostart")
+            .flex()
+            .items_center()
+            .h(px(16.))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|w, _, _, cx| {
+                    autostart::set(!w.autostart);
+                    w.autostart = autostart::enabled(); // show what actually got written
+                    cx.notify();
+                }),
+            )
+            .child(div().flex_1().text_color(dim()).child("Start with Windows"))
+            .child(switch(self.autostart))
+    }
+}
+
 impl Render for Widget {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let root = div().size_full().bg(rgba(0x16171bb8)).text_color(rgb(0xf0f0f2)).text_xs();
         if self.mini {
             return root.child(self.render_mini()).into_any_element();
@@ -560,6 +674,23 @@ impl Render for Widget {
                     .child(div().px_1().text_color(dim()).child(concat!("v", env!("CARGO_PKG_VERSION"))))
                     .child(
                         div()
+                            .id("settings")
+                            .px_1()
+                            .rounded_full()
+                            .text_color(if self.settings { rgb(ORANGE).into() } else { dim() })
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgba(0xffffff1a)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|w, _, _, cx| {
+                                    w.settings = !w.settings;
+                                    cx.notify();
+                                }),
+                            )
+                            .child("⋯"),
+                    )
+                    .child(
+                        div()
                             .id("close")
                             .px_1()
                             .rounded_full()
@@ -572,6 +703,7 @@ impl Render for Widget {
             )
             .child(self.render_full())
             .child(self.render_net())
+            .children(self.settings.then(|| self.render_settings(cx)))
             .into_any_element()
     }
 }

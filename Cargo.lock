@@ -869,7 +869,7 @@ dependencies = [
 
 [[package]]
 name = "claude-usage"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "gpui",
